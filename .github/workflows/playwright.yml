@@ -21,11 +21,10 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Run Playwright tests
         run: npx playwright test
-      - name: Upload Playwright Report
-        uses: actions/upload-artifact@v2
+      - name: Archive test results
         if: always()
-        with:
-          name: playwright-report
-          path: playwright-report/
-          retention-days: 30
-        continue-on-error: true
+        run: |
+          tar -czf playwright-report.tar.gz playwright-report/
+          echo "Report archived to playwright-report.tar.gz"
+          # Print the report location for manual download if needed
+          echo "You can find the report in the workflow logs"
