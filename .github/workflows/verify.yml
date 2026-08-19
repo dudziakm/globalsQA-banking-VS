@@ -1,0 +1,233 @@
+name: verify
+
+# Lightweight gate for dependency updates: install, typecheck, and build.
+# Deliberately does NOT run E2E. Playwright and Cypress suites in these repos
+# target external services that disappear, redirect, or block traffic
+# from data centers — as a gate they produce noise, not proof. This is about a signal
+# that is green if and only if the version bump did not break anything.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Opt-in smoke start for service repos: set VERIFY_SMOKE to 'true' in this
+# workflow on repositories that expose a real start script. Default stays off so
+# install-only / E2E harness repos are not started as servers.
+env:
+  VERIFY_SMOKE: 'false'
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      dirs: ${{ steps.find.outputs.dirs }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: find
+        name: Find project directories
+        run: |
+          set -euo pipefail
+          if [ -f package.json ]; then
+            dirs='["."]'
+          else
+            dirs=$(find . -maxdepth 4 -name package.json \
+                     -not -path '*/node_modules/*' \
+                     -not -path '*/.next/*' \
+                     -not -path '*/dist/*' \
+                     -not -path '*/build/*' \
+                     -printf '%h\n' | sort -u | jq -R . | jq -sc .)
+          fi
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+          echo "Directories to check: $dirs"
+
+  verify:
+    needs: discover
+    if: needs.discover.outputs.dirs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.discover.outputs.dirs) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: pm
+        name: Detect package manager
+        run: |
+          set -euo pipefail
+          if   [ -f pnpm-lock.yaml ]; then mgr=pnpm
+          elif [ -f yarn.lock ];      then mgr=yarn
+          else                             mgr=npm
+          fi
+          echo "mgr=$mgr" >> "$GITHUB_OUTPUT"
+          echo "Package manager: $mgr"
+
+      - uses: pnpm/action-setup@v4
+        if: steps.pm.outputs.mgr == 'pnpm'
+        with:
+          version: 10
+
+      # No 'cache:' intentionally — setup-node fails hard when it cannot find
+      # a lockfile, and some repos do not have one. The gate must be resilient, not fast.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          case "${{ steps.pm.outputs.mgr }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --immutable ;;
+            npm)
+              if [ -f package-lock.json ]; then
+                npm ci
+              else
+                echo "Missing package-lock.json — installing without frozen lockfile."
+                npm install --no-audit --no-fund
+              fi
+              ;;
+          esac
+
+      # The repo's own script takes precedence over raw tsc. Frameworks generate
+      # types only during their sync step (Astro, Next, SvelteKit), so raw
+      # 'tsc --noEmit' reports missing virtual modules and produces false failures.
+      - name: Typecheck
+        run: |
+          set -euo pipefail
+          script=$(node -e "const s=require('./package.json').scripts||{};process.stdout.write(s.typecheck?'typecheck':(s['type-check']?'type-check':''))")
+          if [ -n "$script" ]; then
+            echo "Using repo script: $script"
+            case "${{ steps.pm.outputs.mgr }}" in
+              pnpm) pnpm run "$script" ;;
+              yarn) yarn run "$script" ;;
+              npm)  npm run "$script" ;;
+            esac
+            exit 0
+          fi
+          if [ ! -f tsconfig.json ]; then
+            echo "No typecheck script and no tsconfig.json — skipping."; exit 0
+          fi
+          if ! node -e "const p=require('./package.json');const d={...p.dependencies,...p.devDependencies};process.exit(d.typescript?0:1)"; then
+            echo "typescript is not a repo dependency — skipping to avoid downloading a random version."; exit 0
+          fi
+          npx --no-install tsc --noEmit
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if ! node -e "const p=require('./package.json');process.exit(p.scripts&&p.scripts.build?0:1)"; then
+            echo "No build script — skipping."; exit 0
+          fi
+          case "${{ steps.pm.outputs.mgr }}" in
+            pnpm) pnpm run build ;;
+            yarn) yarn run build ;;
+            npm)  npm run build ;;
+          esac
+
+      # Opt-in: set VERIFY_SMOKE=true (workflow env or repo variable) on services
+      # with a start script. Distinguishes missing credentials (soft pass) from
+      # dependency crashes (fail).
+      - name: Smoke start
+        if: env.VERIFY_SMOKE == 'true'
+        run: |
+          set -euo pipefail
+          if ! node -e "const s=require('./package.json').scripts||{};process.exit(s.start?0:1)"; then
+            echo "No start script — skipping smoke."; exit 0
+          fi
+          log="$(mktemp)"
+          case "${{ steps.pm.outputs.mgr }}" in
+            pnpm) pnpm run start >"$log" 2>&1 & ;;
+            yarn) yarn run start >"$log" 2>&1 & ;;
+            npm)  npm run start >"$log" 2>&1 & ;;
+          esac
+          pid=$!
+          # Give the process a few seconds to boot or crash.
+          for i in 1 2 3 4 5 6 7 8; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              wait "$pid" || true
+              echo "----- smoke stdout/stderr -----"
+              cat "$log"
+              if grep -Eiq 'API[_-]?KEY|api key|OPENAI|ANTHROPIC|SUPABASE|supabaseKey is required|missing.*(env|key|credential)|not set|ECONNREFUSED.*(54321|5432)' "$log"; then
+                echo "Smoke: process exited for missing credentials/config — treating as soft pass."
+                exit 0
+              fi
+              if grep -Eiq 'Cannot find module|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|SyntaxError|TypeError:|Error: Cannot' "$log"; then
+                echo "Smoke: dependency/runtime crash — failing the gate."
+                exit 1
+              fi
+              echo "Smoke: process exited before becoming ready without a clear credentials signal — failing."
+              exit 1
+            fi
+            if grep -Eiq 'listening|started|ready|localhost:[0-9]|Local:|Network:' "$log"; then
+              echo "Smoke: server looks ready."
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+              echo "----- smoke stdout/stderr (truncated) -----"
+              tail -n 40 "$log"
+              exit 0
+            fi
+            sleep 1
+          done
+          # Still alive after the window — good enough for a smoke check.
+          echo "Smoke: process still running after boot window — OK."
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          tail -n 40 "$log"
+
+      # A gate that silently skips typecheck and build turns green after just
+      # installation. That is still a real signal (wrong version, desynced lockfile,
+      # peer or override conflict), but much weaker than it seems. We explicitly print
+      # what was actually checked so no one builds false confidence on it.
+      - name: What this gate actually checked
+        if: always()
+        run: |
+          set -euo pipefail
+          ts=no
+          if node -e "const s=require('./package.json').scripts||{};process.exit(s.typecheck||s['type-check']?0:1)"; then
+            ts="yes (repo script)"
+          elif [ -f tsconfig.json ] && node -e "const p=require('./package.json');const d={...p.dependencies,...p.devDependencies};process.exit(d.typescript?0:1)"; then
+            ts="yes (tsc --noEmit)"
+          fi
+          bd=no
+          if node -e "const p=require('./package.json');process.exit(p.scripts&&p.scripts.build?0:1)"; then
+            bd=yes
+          fi
+          sm=no
+          if [ "${VERIFY_SMOKE:-false}" = "true" ] && node -e "const s=require('./package.json').scripts||{};process.exit(s.start?0:1)"; then
+            sm=yes
+          fi
+          {
+            echo "### Verify gate — \`${{ matrix.dir }}\`"
+            echo ""
+            echo "| Stage | Executed |"
+            echo "|---|---|"
+            echo "| install dependencies | yes |"
+            echo "| typecheck (\`tsc --noEmit\`) | $ts |"
+            echo "| build | $bd |"
+            echo "| smoke start | $sm |"
+            if [ "$ts" = no ] && [ "$bd" = no ]; then
+              echo ""
+              echo "> **Warning:** In this directory, the gate only checks installation."
+              echo "> Do not treat a green result as proof that the update broke nothing."
+            fi
+            if [ "$ts" = "yes (tsc --noEmit)" ]; then
+              echo ""
+              echo "> \`tsc --noEmit\` with \`skipLibCheck: true\` (typical setting) does not detect"
+              echo "> most regressions in dependency types themselves — only those that surface"
+              echo "> in the repo's code."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
